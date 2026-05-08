@@ -22,21 +22,8 @@ jobs:
           git push origin $TAG
           echo "name=$TAG" >> $GITHUB_OUTPUT
 
-      - name: Create source zip
-        run: |
-          zip sourcecode.zip \
-            main.py \
-            icon.png \
-            icon.ico \
-            README.md \
-            requirements.txt \
-            run.bat \
-            setup_portable.bat \
-            VideoTranscriber.ini
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          files: sourcecode.zip
           generate_release_notes: true
