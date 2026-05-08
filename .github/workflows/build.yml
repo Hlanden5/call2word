@@ -1,43 +1,33 @@
-name: Build
+name: Release
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+    tags:
+      - "v*"
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
+      - name: Create source zip
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          zip sourcecode.zip \
+            main.py \
+            icon.png \
+            icon.ico \
+            README.md \
+            requirements.txt \
+            run.bat \
+            setup_portable.bat \
+            VideoTranscriber.ini
 
-      - name: Build Windows
-        if: runner.os == 'Windows'
-        run: pyinstaller --onefile --windowed --icon=icon.ico --name VideoTranscriber main.py
-
-      - name: Build Linux
-        if: runner.os == 'Linux'
-        run: pyinstaller --onefile --windowed --icon=icon.png --name VideoTranscriber main.py
-
-      - name: Build macOS
-        if: runner.os == 'macOS'
-        run: pyinstaller --windowed --icon=icon.png --name VideoTranscriber main.py
-
-      - uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: VideoTranscriber-${{ runner.os }}
-          path: dist/**
+          files: sourcecode.zip
+          generate_release_notes: true
