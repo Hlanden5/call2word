@@ -24,10 +24,9 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -37,6 +36,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStatusBar,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -44,9 +45,10 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "VideoTranscriber"
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.8"
 SUPPORTED_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
-MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"]
+TELEMOST_PREFIX = "Встреча в Телемосте"
+MODELS = ["large-v3-turbo", "large-v3"]
 SPEED_MODES = {
     "Быстро": {
         "beam_size": 1,
@@ -103,6 +105,7 @@ DEFAULT_TEMPLATE = """Ты — редактор и аналитик созвон
 - Делай столько блоков, сколько реально нужно по смыслу: не растягивай искусственно.
 - Название блока должно быть смысловым, например "Сертификация и защита персональных данных", а не "Часть 1" или "Обсуждение".
 - Если данных для поля нет, ставь пустой массив [] или null.
+- Если смысл фразы неразборчив, но можно восстановить по контексту — восстанови, но добавь в поле "risks" запись вида: "⚠ Додумано: '[что додумано]' — потому что [причина вывода]".
 - Не выдумывай имена, факты, сроки и решения, которых нет в расшифровке.
 - Убирай воду и повторы, но не теряй важные детали.
 - На выходе не упоминай длину расшифровки, абзацы, переносы строк или техническую подготовку текста.
@@ -111,38 +114,14 @@ DEFAULT_TEMPLATE = """Ты — редактор и аналитик созвон
 {text}"""
 
 MODEL_INFO = {
-    "tiny": {
-        "ram": "1-2 ГБ RAM",
-        "disk": "~75 МБ модели",
-        "speed": "очень быстро",
-        "quality": "только черновик, русский часто плохой",
-    },
-    "base": {
-        "ram": "2 ГБ RAM",
-        "disk": "~150 МБ модели",
-        "speed": "быстро",
-        "quality": "для русского часто слабовато",
-    },
-    "small": {
-        "ram": "3-4 ГБ RAM",
-        "disk": "~500 МБ модели",
-        "speed": "нормально",
-        "quality": "рекомендуемый баланс для русского",
-    },
-    "medium": {
-        "ram": "6-8 ГБ RAM",
-        "disk": "~1.5 ГБ модели",
-        "speed": "медленно на CPU",
-        "quality": "лучше для сложной речи",
-    },
     "large-v3-turbo": {
-        "ram": "8-10 ГБ RAM",
+        "ram": "~2-3 ГБ RAM",
         "disk": "~1.6 ГБ модели",
         "speed": "средне/медленно на CPU",
         "quality": "сильная модель, быстрее full large",
     },
     "large-v3": {
-        "ram": "12-16 ГБ RAM",
+        "ram": "~4-5 ГБ RAM",
         "disk": "~3 ГБ модели",
         "speed": "очень медленно на CPU",
         "quality": "лучшее качество, требует много памяти",
@@ -172,9 +151,15 @@ def format_seconds(seconds: float) -> str:
 def default_cpu_threads() -> int:
     """Return a sensible CPU thread count for faster-whisper."""
     cores = os.cpu_count() or 4
-    if cores <= 2:
+    return max(1, cores)
+
+
+def performance_cpu_threads() -> int:
+    """Return a fast CPU thread count that avoids common oversubscription losses."""
+    cores = os.cpu_count() or 4
+    if cores <= 4:
         return cores
-    return max(1, cores - 1)
+    return max(1, min(cores, round(cores * 0.75)))
 
 
 def scan_video_folder(folder: Path) -> list[Path]:
@@ -401,34 +386,113 @@ def write_docx(path: Path, title: str, body: str) -> None:
         docx.writestr("word/styles.xml", styles_xml)
 
 
-class FileList(QListWidget):
-    """Single-select checkable list of video files with drag-and-drop support."""
+def _get_duration(path: Path) -> str:
+    """Return duration string 'MM:SS' for a video file.
+    Tries mutagen/struct for webm, falls back to mtime-ctime delta."""
+    try:
+        import struct
+        # Parse WebM/Matroska duration from EBML header (~fast, no deps)
+        with open(path, "rb") as f:
+            data = f.read(65536)
+        # Find TimecodeScale and Duration in EBML
+        # Duration element ID: 0x4489, float64
+        idx = data.find(b"\x44\x89")
+        if idx != -1 and idx + 10 < len(data):
+            size_byte = data[idx + 2]
+            if size_byte == 0x88:  # 8-byte double
+                val = struct.unpack(">d", data[idx + 3:idx + 11])[0]
+                # find TimecodeScale (default 1000000 ns = 1ms)
+                scale = 1_000_000
+                ts_idx = data.find(b"\x2A\xD7\xB1")
+                if ts_idx != -1 and ts_idx + 6 < len(data):
+                    sb = data[ts_idx + 3]
+                    n_bytes = bin(sb).lstrip("0b").find("1") + 1 if sb else 4
+                    n_bytes = max(1, min(n_bytes, 4))
+                    scale_bytes = data[ts_idx + 3:ts_idx + 3 + n_bytes]
+                    # strip VINT prefix
+                    scale = int.from_bytes(scale_bytes, "big") & (0xFF >> (n_bytes - 1).bit_length())
+                    if scale == 0:
+                        scale = 1_000_000
+                secs = val * scale / 1_000_000_000
+                if 0 < secs < 86400:
+                    return format_seconds(secs)
+    except Exception:
+        pass
+    # fallback: mtime - ctime ≈ duration for Telemost recordings
+    try:
+        stat = path.stat()
+        delta = stat.st_mtime - getattr(stat, "st_birthtime", stat.st_ctime)
+        if 10 < delta < 86400:
+            return format_seconds(delta)
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_telemost_name(stem: str) -> tuple[str, str]:
+    """Extract date and time from 'Встреча в Телемосте ДД.ММ.ГГ ЧЧ-ММ-СС — запись'.
+    Returns (date_str, time_str) or ('', '') if not matched."""
+    m = re.search(r"(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}-\d{2}(?:-\d{2})?)", stem)
+    if not m:
+        return "", ""
+    date = m.group(1)
+    time_raw = m.group(2).replace("-", ":")
+    return date, time_raw
+
+
+class FileList(QTableWidget):
+    """Checkable table: Telemost mode shows Встречи/Дата/Время, generic mode shows Файл."""
 
     files_changed = Signal()
 
+    _COL_CHECK = 0
+    _COL_NAME  = 1
+    _COL_DATE  = 2
+    _COL_TIME  = 3
+    _COL_DUR   = 4
+
     def __init__(self, parent: QWidget | None = None) -> None:
-        """Configure list behavior and visual affordances."""
-        super().__init__(parent)
+        super().__init__(0, 5, parent)
         self._syncing_checks = False
+        self._telemost_mode = False
+        self.verticalHeader().setVisible(False)
+        self.setSelectionBehavior(QTableWidget.SelectRows)
+        self.setEditTriggers(QTableWidget.NoEditTriggers)
         self.setAcceptDrops(True)
         self.setAlternatingRowColors(True)
-        self.setSelectionMode(QListWidget.ExtendedSelection)
-        self.setToolTip("Перетащите сюда видео или папку с видео")
+        self.setToolTip("Перетащите сюда видео или папку")
         self.itemChanged.connect(self._keep_only_one_checked)
+        self._set_list_mode()
 
-    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt method name
-        """Accept local files and folders."""
+    def _set_list_mode(self) -> None:
+        self._telemost_mode = False
+        self.setColumnCount(2)
+        self.setHorizontalHeaderLabels(["", "Файл"])
+        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.setColumnWidth(0, 28)
+
+    def _set_telemost_mode(self) -> None:
+        self._telemost_mode = True
+        self.setColumnCount(5)
+        self.setHorizontalHeaderLabels(["", "Встречи в Телемосте", "Дата", "Время", "Длит."])
+        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.setColumnWidth(0, 28)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt method name
-        """Keep drag acceptance while the pointer is over the list."""
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
         self.dragEnterEvent(event)
 
-    def dropEvent(self, event) -> None:  # noqa: N802 - Qt method name
-        """Add dropped videos or recursively scan dropped folders."""
+    def dropEvent(self, event) -> None:  # noqa: N802
         paths: list[Path] = []
         for url in event.mimeData().urls():
             if not url.isLocalFile():
@@ -442,60 +506,96 @@ class FileList(QListWidget):
         event.acceptProposedAction()
 
     def add_files(self, paths: list[Path | str]) -> int:
-        """Add unique supported files; check only one file for the current run."""
-        existing = {self.item(i).data(Qt.UserRole) for i in range(self.count())}
+        valid = [
+            Path(p).resolve() for p in paths
+            if Path(p).suffix.lower() in SUPPORTED_EXTENSIONS and Path(p).is_file()
+        ]
+        if not valid:
+            return 0
+
+        # determine mode from first new file
+        is_telemost = all(p.stem.startswith(TELEMOST_PREFIX) for p in valid)
+        if self.rowCount() == 0:
+            if is_telemost:
+                self._set_telemost_mode()
+            else:
+                self._set_list_mode()
+
+        existing = {self.item(r, self._COL_CHECK).data(Qt.UserRole)
+                    for r in range(self.rowCount())
+                    if self.item(r, self._COL_CHECK)}
         has_checked = bool(self.checked_paths())
         added = 0
-        for raw_path in paths:
-            path = Path(raw_path).resolve()
-            if path.suffix.lower() not in SUPPORTED_EXTENSIONS or not path.is_file():
-                continue
-            if str(path) in existing:
-                continue
-            item = QListWidgetItem(path.name)
-            item.setToolTip(str(path))
-            item.setData(Qt.UserRole, str(path))
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if not has_checked else Qt.Unchecked)
-            self.addItem(item)
-            existing.add(str(path))
-            has_checked = True
-            added += 1
+        self._syncing_checks = True
+        try:
+            for path in valid:
+                if str(path) in existing:
+                    continue
+
+                row = self.rowCount()
+                self.insertRow(row)
+
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                chk.setCheckState(Qt.Checked if not has_checked else Qt.Unchecked)
+                chk.setData(Qt.UserRole, str(path))
+                self.setItem(row, self._COL_CHECK, chk)
+
+                if self._telemost_mode:
+                    date_str, time_str = _parse_telemost_name(path.stem)
+                    label = path.stem.replace(TELEMOST_PREFIX, "").strip(" —")
+                    name_item = QTableWidgetItem(label)
+                    name_item.setData(Qt.UserRole, str(path))
+                    name_item.setToolTip(str(path))
+                    self.setItem(row, self._COL_NAME, name_item)
+                    self.setItem(row, self._COL_DATE, QTableWidgetItem(date_str))
+                    self.setItem(row, self._COL_TIME, QTableWidgetItem(time_str))
+                    self.setItem(row, self._COL_DUR,  QTableWidgetItem(_get_duration(path)))
+                else:
+                    name_item = QTableWidgetItem(path.name)
+                    name_item.setData(Qt.UserRole, str(path))
+                    name_item.setToolTip(str(path))
+                    self.setItem(row, self._COL_NAME, name_item)
+
+                existing.add(str(path))
+                has_checked = True
+                added += 1
+        finally:
+            self._syncing_checks = False
         if added:
             self.files_changed.emit()
         return added
 
     def checked_paths(self) -> list[str]:
-        """Return the single file whose checkbox is enabled."""
-        for index in range(self.count()):
-            item = self.item(index)
-            if item.checkState() == Qt.Checked:
-                return [item.data(Qt.UserRole)]
+        for row in range(self.rowCount()):
+            chk = self.item(row, self._COL_CHECK)
+            if chk and chk.checkState() == Qt.Checked:
+                return [chk.data(Qt.UserRole)]
         return []
 
     def set_all_checked(self, checked: bool) -> None:
-        """Pick the newest file or clear the current processing choice."""
         self._syncing_checks = True
         try:
-            for index in range(self.count()):
-                state = Qt.Checked if checked and index == 0 else Qt.Unchecked
-                self.item(index).setCheckState(state)
+            for row in range(self.rowCount()):
+                chk = self.item(row, self._COL_CHECK)
+                if chk:
+                    chk.setCheckState(Qt.Checked if checked and row == 0 else Qt.Unchecked)
         finally:
             self._syncing_checks = False
         self.files_changed.emit()
 
-    def _keep_only_one_checked(self, changed_item: QListWidgetItem) -> None:
-        """Ensure the current version processes one video per run."""
-        if self._syncing_checks:
+    def _keep_only_one_checked(self, changed_item: QTableWidgetItem) -> None:
+        if self._syncing_checks or changed_item.column() != self._COL_CHECK:
             return
-
+        if changed_item.checkState() != Qt.Checked:
+            self.files_changed.emit()
+            return
         self._syncing_checks = True
         try:
-            if changed_item.checkState() == Qt.Checked:
-                for index in range(self.count()):
-                    item = self.item(index)
-                    if item is not changed_item:
-                        item.setCheckState(Qt.Unchecked)
+            for row in range(self.rowCount()):
+                chk = self.item(row, self._COL_CHECK)
+                if chk and chk is not changed_item:
+                    chk.setCheckState(Qt.Unchecked)
         finally:
             self._syncing_checks = False
         self.files_changed.emit()
@@ -510,13 +610,21 @@ class TranscribeWorker(QThread):
     all_done = Signal()
     error = Signal(str)
 
-    def __init__(self, files: list[str], model_size: str, cpu_threads: int, speed_mode: str) -> None:
+    def __init__(
+        self,
+        files: list[str],
+        model_size: str,
+        cpu_threads: int,
+        speed_mode: str,
+        vad_filter: bool,
+    ) -> None:
         """Store immutable worker parameters before the thread starts."""
         super().__init__()
         self.files = files
         self.model_size = model_size
         self.cpu_threads = max(1, int(cpu_threads))
         self.speed_mode = speed_mode if speed_mode in SPEED_MODES else "Быстро"
+        self.vad_filter = vad_filter
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -545,7 +653,7 @@ class TranscribeWorker(QThread):
                 device="cpu",
                 compute_type="int8",
                 cpu_threads=self.cpu_threads,
-                num_workers=1,
+                num_workers=4,
             )
         except MemoryError:
             self.error.emit("Недостаточно памяти для модели. Попробуйте small, base или tiny.")
@@ -579,9 +687,14 @@ class TranscribeWorker(QThread):
             with tempfile.TemporaryDirectory(prefix="video_transcriber_") as tmp_dir:
                 audio_path = Path(tmp_dir) / "audio.wav"
                 self._extract_audio(path, audio_path)
-                text = self._transcribe_audio(model, audio_path)
+                self._denoise_audio(audio_path)
+                text, audio_duration = self._transcribe_audio(model, audio_path)
                 elapsed = format_seconds(time.monotonic() - started)
-                self.progress.emit(f"Готово: {path.name}, время обработки {elapsed}")
+                elapsed_raw = max(time.monotonic() - started, 0.1)
+                realtime = audio_duration / elapsed_raw if audio_duration else 0.0
+                self.progress.emit(
+                    f"Готово: {path.name}, время обработки {elapsed}, скорость {realtime:.2f}x realtime"
+                )
                 self.file_done.emit(str(path), text)
         except MemoryError:
             self.error.emit(f"{path.name}: не хватает RAM. Выберите модель меньше.")
@@ -592,6 +705,23 @@ class TranscribeWorker(QThread):
             self.error.emit("ffmpeg not found. imageio-ffmpeg должен был поставить бинарь автоматически.")
         except Exception as exc:
             self.error.emit(f"{path.name}: ошибка обработки: {exc}")
+
+    def _denoise_audio(self, audio_path: Path) -> None:
+        """Apply highpass + stationary noisereduce in-place (COMBINED preset)."""
+        try:
+            import soundfile as sf
+            import noisereduce as nr
+            from scipy.signal import butter, sosfilt
+        except ImportError:
+            self.progress.emit("Деноизинг пропущен: установите soundfile noisereduce scipy")
+            return
+
+        self.progress.emit("Деноизинг: highpass + noisereduce stationary...")
+        data, sr = sf.read(str(audio_path), dtype="float32")
+        sos = butter(4, 80, btype="high", fs=sr, output="sos")
+        data = sosfilt(sos, data).astype("float32")
+        data = nr.reduce_noise(y=data, sr=sr, stationary=True, prop_decrease=0.8)
+        sf.write(str(audio_path), data, sr)
 
     def _extract_audio(self, video_path: Path, audio_path: Path) -> None:
         """Create a 16 kHz mono WAV file via the bundled ffmpeg binary."""
@@ -613,21 +743,25 @@ class TranscribeWorker(QThread):
         ]
         subprocess.run(command, check=True, capture_output=True)
 
-    def _transcribe_audio(self, model, audio_path: Path) -> str:
+    def _transcribe_audio(self, model, audio_path: Path) -> tuple[str, float]:
         """Transcribe Russian audio and return clean plain text."""
         options = SPEED_MODES[self.speed_mode]
         self.progress.emit(
             "Транскрипция: "
             f"режим={self.speed_mode}, beam_size={options['beam_size']}, "
-            "language=ru, vad_filter=True..."
+            f"language=ru, vad_filter={self.vad_filter}..."
         )
         segments, info = model.transcribe(
             str(audio_path),
             language="ru",
             beam_size=options["beam_size"],
-            vad_filter=True,
+            vad_filter=self.vad_filter,
+            vad_parameters={"threshold": 0.5, "min_silence_duration_ms": 500},
             condition_on_previous_text=options["condition_on_previous_text"],
             without_timestamps=False,
+            initial_prompt="Транскрипция рабочего созвона на русском языке.",
+            temperature=0.0,
+            repetition_penalty=1.1,
         )
         duration = max(float(getattr(info, "duration", 0.0) or 0.0), 1.0)
         rows: list[dict[str, float | str]] = []
@@ -642,7 +776,7 @@ class TranscribeWorker(QThread):
             self.progress_value.emit(percent)
 
         self.progress_value.emit(100)
-        return " ".join(str(row["text"]) for row in rows).strip()
+        return " ".join(str(row["text"]) for row in rows).strip(), duration
 
 
 class MainWindow(QMainWindow):
@@ -696,11 +830,15 @@ class MainWindow(QMainWindow):
         self.model_info_label.setObjectName("modelInfo")
         self.model_info_label.setWordWrap(True)
 
+
+        self.vad_check = QCheckBox("VAD паузы")
+        self.vad_check.setToolTip("Обрезает тишину. Помогает, если много пауз; на непрерывном созвоне может быть медленнее.")
         self.compact_prompt_check = QCheckBox("Сжимать расшифровку для LLM")
         self.auto_save_check = QCheckBox("Автосохранять промт в .txt")
-        self.save_dir_edit = QLineEdit(str(app_dir() / "outputs"))
-        self.save_dir_edit.setReadOnly(True)
+        self.save_dir_edit = QLineEdit()
+        self.save_dir_edit.setVisible(False)
         self.save_dir_button = QPushButton("Папка")
+        self.save_dir_button.setVisible(False)
 
         self.open_folder_button = QPushButton("Открыть папку")
         self.run_button = QPushButton("Запустить")
@@ -758,6 +896,7 @@ class MainWindow(QMainWindow):
         self.save_button.clicked.connect(lambda: self._save_prompt_file(manual=True))
         self.paste_llm_button.clicked.connect(self._paste_llm_answer)
         self.save_word_button.clicked.connect(self._save_word_file)
+
         self.save_dir_button.clicked.connect(self._choose_save_dir)
         self.check_all_button.clicked.connect(lambda: self.file_list.set_all_checked(True))
         self.uncheck_all_button.clicked.connect(lambda: self.file_list.set_all_checked(False))
@@ -766,6 +905,7 @@ class MainWindow(QMainWindow):
         self.model_combo.currentTextChanged.connect(self._update_model_info)
         self.speed_combo.currentTextChanged.connect(self._update_model_info)
         self.cpu_threads_spin.valueChanged.connect(self._update_model_info)
+        self.vad_check.stateChanged.connect(self._update_model_info)
         self.template_edit.textChanged.connect(self._refresh_prompt)
         self.compact_prompt_check.stateChanged.connect(self._refresh_prompt)
 
@@ -840,25 +980,16 @@ class MainWindow(QMainWindow):
 
         model_title = QLabel("Модель и режим")
         model_title.setObjectName("sectionTitle")
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Whisper"))
-        model_row.addWidget(self.model_combo, 1)
-        speed_row = QHBoxLayout()
-        speed_row.addWidget(QLabel("Скорость"))
-        speed_row.addWidget(self.speed_combo, 1)
-        speed_row.addWidget(self.cpu_threads_spin)
+        threads_row = QHBoxLayout()
+        threads_row.addWidget(QLabel("CPU потоков"))
+        threads_row.addWidget(self.cpu_threads_spin)
 
         layout.addWidget(model_title)
-        layout.addLayout(model_row)
-        layout.addLayout(speed_row)
+        layout.addLayout(threads_row)
         layout.addWidget(self.model_info_label)
         layout.addWidget(self.compact_prompt_check)
         layout.addWidget(self.auto_save_check)
 
-        save_row = QHBoxLayout()
-        save_row.addWidget(self.save_dir_edit, 1)
-        save_row.addWidget(self.save_dir_button)
-        layout.addLayout(save_row)
 
         action_row = QHBoxLayout()
         action_row.addWidget(self.run_button)
@@ -919,12 +1050,10 @@ class MainWindow(QMainWindow):
     def _load_settings(self) -> None:
         """Load model, prompt template, and save options."""
         settings_version = str(self.settings.value("settings_version", ""))
-        model = self.settings.value("model", "small")
-        if not settings_version:
-            model = "small"
-        self.model_combo.setCurrentText(model if model in MODELS else "small")
-        speed_mode = self.settings.value("speed_mode", "Быстро")
-        self.speed_combo.setCurrentText(speed_mode if speed_mode in SPEED_MODES else "Быстро")
+        # model, speed and VAD are fixed — not user-configurable
+        self.model_combo.setCurrentText("large-v3-turbo")
+        self.speed_combo.setCurrentText("Баланс")
+        self.vad_check.setChecked(True)
         threads = self.settings.value("cpu_threads", default_cpu_threads(), type=int)
         max_threads = self.cpu_threads_spin.maximum()
         self.cpu_threads_spin.setValue(min(max(1, int(threads)), max_threads))
@@ -936,14 +1065,24 @@ class MainWindow(QMainWindow):
 
         self.compact_prompt_check.setChecked(self.settings.value("compact_prompt", True, type=bool))
         self.auto_save_check.setChecked(self.settings.value("auto_save", True, type=bool))
-        save_dir = self.settings.value("save_dir", str(app_dir() / "outputs"))
-        self.save_dir_edit.setText(str(save_dir))
+        saved_dir = self.settings.value("save_dir", "")
+        if not saved_dir:
+            try:
+                profiles_root = Path(os.environ.get("SYSTEMDRIVE", "C:")) / "Users"
+                for user_dir in sorted(profiles_root.iterdir()):
+                    candidate = user_dir / "Documents" / "Телемост"
+                    if candidate.is_dir():
+                        saved_dir = str(candidate)
+                        break
+            except Exception:
+                pass
+        self.save_dir_edit.setText(saved_dir)
+        if saved_dir and Path(saved_dir).is_dir():
+            QTimer.singleShot(0, lambda: self._open_folder(Path(saved_dir)))
         self._refresh_prompt()
 
     def _save_settings(self) -> None:
         """Persist settings next to the executable/source file."""
-        self.settings.setValue("model", self.model_combo.currentText())
-        self.settings.setValue("speed_mode", self.speed_combo.currentText())
         self.settings.setValue("cpu_threads", self.cpu_threads_spin.value())
         self.settings.setValue("template", self.template_edit.toPlainText())
         self.settings.setValue("compact_prompt", self.compact_prompt_check.isChecked())
@@ -968,23 +1107,24 @@ class MainWindow(QMainWindow):
             or "РќРёР¶Рµ" in text
         )
 
-    def _choose_folder(self) -> None:
-        """Open a folder and add all supported videos found recursively."""
-        folder = QFileDialog.getExistingDirectory(self, "Открыть папку с видео", "")
-        if not folder:
-            return
-        self.current_folder = Path(folder).resolve()
-        files = scan_video_folder(self.current_folder)
+    def _open_folder(self, folder: Path) -> None:
+        self.current_folder = folder
+        files = scan_video_folder(folder)
         self.file_list.clear()
         self.transcripts.clear()
         self.prompt_edit.clear()
         self.llm_edit.clear()
         added = self.file_list.add_files(files)
-        self._log(f"Папка: {self.current_folder}")
+        self._log(f"Папка: {folder}")
         self._log(f"Найдено видео: {len(files)}, добавлено новых: {added}")
-        if self.auto_save_check.isChecked():
-            self.save_dir_edit.setText(str(self.current_folder))
         self._update_status("Папка открыта")
+
+    def _choose_folder(self) -> None:
+        """Open a folder and add all supported videos found recursively."""
+        folder = QFileDialog.getExistingDirectory(self, "Открыть папку с видео", "")
+        if not folder:
+            return
+        self._open_folder(Path(folder).resolve())
 
     def _choose_save_dir(self) -> None:
         """Let the user choose where automatic prompt files are written."""
@@ -1016,6 +1156,7 @@ class MainWindow(QMainWindow):
             self.model_combo.currentText(),
             self.cpu_threads_spin.value(),
             self.speed_combo.currentText(),
+            self.vad_check.isChecked(),
         )
         self.worker.progress.connect(self._log)
         self.worker.progress_value.connect(self.progress_bar.setValue)
@@ -1045,6 +1186,26 @@ class MainWindow(QMainWindow):
         self._log("Готовый промт скопирован в буфер обмена.")
         self._update_status("Промт скопирован")
 
+    def _output_stem(self) -> str:
+        """Return a base filename from the current source video, or timestamp fallback."""
+        if self.transcripts:
+            src = Path(next(iter(self.transcripts)))
+            return src.stem
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def _resolve_save_dir(self) -> Path:
+        """Subfolder Отчёты/<stem>/ next to source video; explicit field overrides base only."""
+        stem = self._output_stem()
+        if self.transcripts:
+            src = Path(next(iter(self.transcripts)))
+            base = self.save_dir_edit.text().strip()
+            root = Path(base).expanduser() if base else src.parent / "Отчёты"
+            return root / stem
+        explicit = self.save_dir_edit.text().strip()
+        if explicit:
+            return Path(explicit).expanduser()
+        return app_dir() / "outputs"
+
     def _save_prompt_file(self, manual: bool = False) -> Path | None:
         """Save the rendered prompt as UTF-8 text."""
         prompt = self._render_prompt().strip()
@@ -1053,11 +1214,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, APP_NAME, "Промт пока пустой.")
             return None
 
-        save_dir = Path(self.save_dir_edit.text()).expanduser()
+        save_dir = self._resolve_save_dir()
+        stem = self._output_stem()
         try:
             save_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = save_dir / f"prompt_{stamp}.txt"
+            path = save_dir / f"{stem} — расшифровка.txt"
             path.write_text(prompt, encoding="utf-8")
         except Exception as exc:
             self._error(f"Не удалось сохранить промт: {exc}")
@@ -1086,11 +1247,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "Вставьте ответ LLM перед сохранением Word.")
             return None
 
-        save_dir = Path(self.save_dir_edit.text()).expanduser()
+        save_dir = self._resolve_save_dir()
+        stem = self._output_stem()
         try:
             save_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = save_dir / f"llm_answer_{stamp}.docx"
+            path = save_dir / f"{stem} — отчёт.docx"
             write_docx(path, llm_docx_title(answer), format_llm_answer_for_docx(answer))
         except Exception as exc:
             self._error(f"Не удалось сохранить Word: {exc}")
@@ -1098,7 +1259,10 @@ class MainWindow(QMainWindow):
 
         self._log(f"Word сохранен: {path}")
         self._update_status("Word сохранен")
-        QMessageBox.information(self, APP_NAME, f"Word сохранен:\n{path}")
+        try:
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        except Exception:
+            QMessageBox.information(self, APP_NAME, f"Word сохранен:\n{path}")
         return path
 
     def _file_done(self, file_path: str, text: str) -> None:
@@ -1161,12 +1325,9 @@ class MainWindow(QMainWindow):
             self.open_folder_button,
             self.check_all_button,
             self.uncheck_all_button,
-            self.model_combo,
-            self.speed_combo,
             self.cpu_threads_spin,
             self.compact_prompt_check,
             self.auto_save_check,
-            self.save_dir_button,
         ):
             widget.setDisabled(running)
 
@@ -1177,20 +1338,17 @@ class MainWindow(QMainWindow):
 
     def _update_model_info(self) -> None:
         """Show RAM, disk, speed, and quality notes for the selected model."""
-        model = self.model_combo.currentText()
-        info = MODEL_INFO[model]
-        speed_mode = self.speed_combo.currentText()
-        speed_info = SPEED_MODES.get(speed_mode, SPEED_MODES["Быстро"])
+        info = MODEL_INFO["large-v3-turbo"]
+        speed_info = SPEED_MODES["Баланс"]
         self.model_info_label.setText(
             f"{info['ram']} | {info['disk']} | {info['speed']} | {info['quality']}. "
             f"CPU-only, int8, {self.cpu_threads_spin.value()} потоков, "
-            f"{speed_mode.lower()}: {speed_info['description']}. "
-            "Для нормального русского лучше small и выше."
+            f"баланс: {speed_info['description']}, VAD вкл."
         )
 
     def _update_status(self, message: str) -> None:
         """Update metrics and bottom status text."""
-        total = self.file_list.count()
+        total = self.file_list.rowCount()
         checked = len(self.file_list.checked_paths())
         self.file_count_label.setText(f"{total} файлов")
         self.checked_count_label.setText(f"{checked} файл")
@@ -1302,6 +1460,15 @@ class MainWindow(QMainWindow):
         QPushButton:disabled {
             background: #47515b;
             color: #aab4bd;
+        }
+        QPushButton[text="✕"] {
+            background: #3a4652;
+            padding: 8px 8px;
+            min-width: 24px;
+            max-width: 24px;
+        }
+        QPushButton[text="✕"]:hover {
+            background: #c0392b;
         }
         QCheckBox {
             spacing: 8px;

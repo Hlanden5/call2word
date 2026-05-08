@@ -1,7 +1,13 @@
-__pycache__/
-*.py[cod]
-.venv/
-build/
-dist/
-*.spec
-VideoTranscriber.ini
+# ignore everything
+*
+
+# keep only these
+!main.py
+!icon.png
+!icon.ico
+!README.md
+!requirements.txt
+!run.bat
+!setup_portable.bat
+!VideoTranscriber.ini
+!.gitignore
