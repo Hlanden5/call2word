@@ -2,8 +2,8 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   release:
@@ -13,6 +13,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Create tag
+        id: tag
+        run: |
+          TAG="build-$(date +'%Y%m%d-%H%M%S')"
+          git tag $TAG
+          git push origin $TAG
+          echo "name=$TAG" >> $GITHUB_OUTPUT
 
       - name: Create source zip
         run: |
@@ -29,5 +37,6 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.name }}
           files: sourcecode.zip
           generate_release_notes: true
