@@ -51,13 +51,13 @@ TELEMOST_PREFIX = "Встреча в Телемосте"
 MODELS = ["large-v3-turbo", "large-v3"]
 SPEED_MODES = {
     "Быстро": {
-        "beam_size": 1,
+        "beam_size": 5,
         "condition_on_previous_text": False,
         "description": "максимальная скорость, качество чуть ниже",
     },
     "Баланс": {
-        "beam_size": 3,
-        "condition_on_previous_text": False,
+        "beam_size": 5,
+        "condition_on_previous_text": True,
         "description": "быстрее старого режима, обычно нормально для созвонов",
     },
     "Качество": {
@@ -826,6 +826,20 @@ class MainWindow(QMainWindow):
         self.cpu_threads_spin.setSuffix(" потоков")
         self.cpu_threads_spin.setToolTip("Сколько потоков CPU отдавать faster-whisper. Больше потоков = быстрее, но компьютер будет сильнее занят.")
 
+        _cores = os.cpu_count() or 4
+        self._thread_presets = [
+            ("Фон", max(1, _cores // 8), "Фоновый режим — компьютер почти не нагружен"),
+            ("Тихо", max(1, _cores // 4), "Тихий режим — компьютер слегка нагружен"),
+            ("Быстро", max(1, _cores // 2), "Быстрый режим — половина мощности"),
+            ("Макс", max(1, _cores - 1), "Максимум — всё что есть, кроме одного потока"),
+        ]
+        self._preset_buttons: list[QPushButton] = []
+        for label, val, tip in self._thread_presets:
+            btn = QPushButton(label)
+            btn.setToolTip(f"{tip} ({val} шт.)")
+            btn.clicked.connect(lambda _, v=val: self.cpu_threads_spin.setValue(v))
+            self._preset_buttons.append(btn)
+
         self.model_info_label = QLabel()
         self.model_info_label.setObjectName("modelInfo")
         self.model_info_label.setWordWrap(True)
@@ -983,6 +997,8 @@ class MainWindow(QMainWindow):
         threads_row = QHBoxLayout()
         threads_row.addWidget(QLabel("CPU потоков"))
         threads_row.addWidget(self.cpu_threads_spin)
+        for btn in self._preset_buttons:
+            threads_row.addWidget(btn)
 
         layout.addWidget(model_title)
         layout.addLayout(threads_row)
@@ -1469,6 +1485,16 @@ class MainWindow(QMainWindow):
         }
         QPushButton[text="✕"]:hover {
             background: #c0392b;
+        }
+        QPushButton[text="Фон"], QPushButton[text="Тихо"], QPushButton[text="Быстро"], QPushButton[text="Макс"] {
+            background: #2a3a44;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 4px 6px;
+            border: 1px solid #3a5060;
+        }
+        QPushButton[text="Фон"]:hover, QPushButton[text="Тихо"]:hover, QPushButton[text="Быстро"]:hover, QPushButton[text="Макс"]:hover {
+            background: #3a5060;
         }
         QCheckBox {
             spacing: 8px;
