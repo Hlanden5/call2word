@@ -15,7 +15,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 import imageio_ffmpeg
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -166,7 +166,8 @@ def current_device_settings_id() -> str:
 
 def default_save_dir() -> Path:
     """Return the current user's default Telemost folder."""
-    return Path.home() / "Documents" / "Телемост"
+    documents = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+    return (Path(documents) if documents else Path.home() / "Documents") / "Телемост"
 
 
 def performance_cpu_threads() -> int:
@@ -599,6 +600,15 @@ class FileList(QTableWidget):
             self._syncing_checks = False
         self.files_changed.emit()
 
+    def select_latest(self) -> bool:
+        """Select the newest file, which is kept in the first row."""
+        if self.rowCount() == 0:
+            return False
+        self.set_all_checked(True)
+        self.selectRow(0)
+        self.scrollToItem(self.item(0, self._COL_NAME))
+        return True
+
     def _keep_only_one_checked(self, changed_item: QTableWidgetItem) -> None:
         if self._syncing_checks or changed_item.column() != self._COL_CHECK:
             return
@@ -927,7 +937,7 @@ class MainWindow(QMainWindow):
         self.save_word_button.clicked.connect(self._save_word_file)
 
         self.save_dir_button.clicked.connect(self._choose_save_dir)
-        self.check_all_button.clicked.connect(lambda: self.file_list.set_all_checked(True))
+        self.check_all_button.clicked.connect(self._select_latest_file)
         self.uncheck_all_button.clicked.connect(lambda: self.file_list.set_all_checked(False))
         self.file_list.files_changed.connect(lambda: self._update_status("Очередь обновлена"))
         self.file_list.itemChanged.connect(lambda _item: self._update_status("Выбор файлов обновлен"))
@@ -1151,12 +1161,44 @@ class MainWindow(QMainWindow):
         self._log(f"Найдено видео: {len(files)}, добавлено новых: {added}")
         self._update_status("Папка открыта")
 
+    def _default_video_folder(self) -> Path:
+        """Return the best folder to show when choosing videos."""
+        candidates = [
+            getattr(self, "current_folder", None),
+            Path(self.save_dir_edit.text()).expanduser() if self.save_dir_edit.text().strip() else None,
+            default_save_dir(),
+            default_save_dir().parent,
+            Path.home(),
+        ]
+        for candidate in candidates:
+            if candidate and candidate.is_dir():
+                return candidate
+        return app_dir()
+
     def _choose_folder(self) -> None:
         """Open a folder and add all supported videos found recursively."""
-        folder = QFileDialog.getExistingDirectory(self, "Открыть папку с видео", "")
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Открыть папку с видео",
+            str(self._default_video_folder()),
+        )
         if not folder:
             return
         self._open_folder(Path(folder).resolve())
+
+    def _select_latest_file(self) -> None:
+        """Select the newest available video, loading the default folder if needed."""
+        if self.file_list.select_latest():
+            self._update_status("Выбран последний файл")
+            return
+
+        folder = self._default_video_folder()
+        if folder.is_dir():
+            self._open_folder(folder)
+        if self.file_list.select_latest():
+            self._update_status("Выбран последний файл")
+        else:
+            self._update_status("Видео в папке не найдены")
 
     def _choose_save_dir(self) -> None:
         """Let the user choose where automatic prompt files are written."""
