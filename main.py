@@ -154,6 +154,21 @@ def default_cpu_threads() -> int:
     return max(1, cores)
 
 
+def current_device_settings_id() -> str:
+    """Return a stable enough key for machine-specific settings."""
+    parts = (
+        os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "",
+        os.environ.get("USERNAME") or "",
+        str(Path.home()),
+    )
+    return "|".join(parts)
+
+
+def default_save_dir() -> Path:
+    """Return the current user's default Telemost folder."""
+    return Path.home() / "Documents" / "Телемост"
+
+
 def performance_cpu_threads() -> int:
     """Return a fast CPU thread count that avoids common oversubscription losses."""
     cores = os.cpu_count() or 4
@@ -1066,11 +1081,18 @@ class MainWindow(QMainWindow):
     def _load_settings(self) -> None:
         """Load model, prompt template, and save options."""
         settings_version = str(self.settings.value("settings_version", ""))
+        device_id = current_device_settings_id()
+        settings_device_id = str(self.settings.value("device_id", ""))
+        device_changed = settings_device_id != device_id
         # model, speed and VAD are fixed — not user-configurable
         self.model_combo.setCurrentText("large-v3-turbo")
         self.speed_combo.setCurrentText("Баланс")
         self.vad_check.setChecked(True)
-        threads = self.settings.value("cpu_threads", default_cpu_threads(), type=int)
+        threads = (
+            default_cpu_threads()
+            if device_changed
+            else self.settings.value("cpu_threads", default_cpu_threads(), type=int)
+        )
         max_threads = self.cpu_threads_spin.maximum()
         self.cpu_threads_spin.setValue(min(max(1, int(threads)), max_threads))
 
@@ -1081,21 +1103,14 @@ class MainWindow(QMainWindow):
 
         self.compact_prompt_check.setChecked(self.settings.value("compact_prompt", True, type=bool))
         self.auto_save_check.setChecked(self.settings.value("auto_save", True, type=bool))
-        saved_dir = self.settings.value("save_dir", "")
+        saved_dir = "" if device_changed else self.settings.value("save_dir", "")
         if not saved_dir:
-            try:
-                profiles_root = Path(os.environ.get("SYSTEMDRIVE", "C:")) / "Users"
-                for user_dir in sorted(profiles_root.iterdir()):
-                    candidate = user_dir / "Documents" / "Телемост"
-                    if candidate.is_dir():
-                        saved_dir = str(candidate)
-                        break
-            except Exception:
-                pass
+            saved_dir = str(default_save_dir())
         self.save_dir_edit.setText(saved_dir)
         if saved_dir and Path(saved_dir).is_dir():
             QTimer.singleShot(0, lambda: self._open_folder(Path(saved_dir)))
         self._refresh_prompt()
+        self._save_settings()
 
     def _save_settings(self) -> None:
         """Persist settings next to the executable/source file."""
@@ -1104,6 +1119,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("compact_prompt", self.compact_prompt_check.isChecked())
         self.settings.setValue("auto_save", self.auto_save_check.isChecked())
         self.settings.setValue("save_dir", self.save_dir_edit.text())
+        self.settings.setValue("device_id", current_device_settings_id())
         self.settings.setValue("settings_version", APP_VERSION)
         self.settings.sync()
 

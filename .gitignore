@@ -3,11 +3,15 @@
 
 # keep only these
 !main.py
+!main_sherpa.py
+!main_whispercpp.py
 !icon.png
 !icon.ico
 !README.md
 !requirements.txt
 !run.bat
+!run_sherpa.bat
+!run_whispercpp.bat
 !setup_portable.bat
 !VideoTranscriber.ini
 !.gitignore

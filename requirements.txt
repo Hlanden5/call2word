@@ -1,6 +1,8 @@
 PySide6>=6.7
 faster-whisper>=1.1.0
+sherpa-onnx>=1.13.1
 imageio-ffmpeg>=0.5.1
+numpy>=1.26
 noisereduce>=3.0
 soundfile>=0.12
 scipy>=1.11
